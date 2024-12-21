@@ -54,34 +54,51 @@ class Up(nn.Module):
         return self.conv(x)
 
 class HarmonicEmbedding(nn.Module):
-    def __init__(self, embedding_size, max_frequencies=10):
+    def __init__(self, embedding_size=512, max_frequencies=10):
         super().__init__()
         self.embedding_size = embedding_size
         self.max_frequencies = max_frequencies
-        
+
         # Learnable frequency components
         self.frequencies = nn.Parameter(
             torch.randn(max_frequencies, 2) * 0.1
         )
-        
+
         # Phase shifts
         self.phase_shifts = nn.Parameter(
             torch.randn(max_frequencies) * 0.1
         )
-        
+
         # Amplitude weights
         self.amplitudes = nn.Parameter(
             torch.ones(max_frequencies)
         )
-        
-    def forward(self, x):
-        batch_size, _, H, W = x.shape
-        
+
+        # Add a projection layer to match the expected channel dimension
+        self.projection = nn.Sequential(
+            nn.Conv2d(max_frequencies, embedding_size, 1),
+            nn.BatchNorm2d(embedding_size),
+            nn.ReLU(inplace=True)
+        )
+
+        # Add spatial adaptation layers
+        self.spatial_adapt = nn.Sequential(
+            nn.Conv2d(embedding_size, embedding_size, kernel_size=3, padding=1),
+            nn.BatchNorm2d(embedding_size),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(embedding_size, embedding_size, kernel_size=3, padding=1),
+            nn.BatchNorm2d(embedding_size),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x, target_size=None):
+        batch_size, _, H, W = x.shape if target_size is None else (x.shape[0], x.shape[1], *target_size)
+
         # Generate coordinate grid
         pos_x = torch.linspace(-1, 1, W, device=x.device)
         pos_y = torch.linspace(-1, 1, H, device=x.device)
         grid_y, grid_x = torch.meshgrid(pos_y, pos_x, indexing='ij')
-        
+
         # Compute harmonic functions
         harmonics = []
         for i in range(self.max_frequencies):
@@ -89,60 +106,90 @@ class HarmonicEmbedding(nn.Module):
             freq_x, freq_y = self.frequencies[i]
             phase = self.phase_shifts[i]
             amplitude = self.amplitudes[i]
-            
+
             harm = amplitude * torch.sin(
                 2 * torch.pi * (freq_x * grid_x + freq_y * grid_y) + phase
             )
             harmonics.append(harm)
-        
+
         # Stack and reshape harmonics
         harmonic_features = torch.stack(harmonics, dim=0)
         harmonic_features = harmonic_features.expand(batch_size, -1, -1, -1)
-        return harmonic_features
+
+        # Project to higher dimension
+        features = self.projection(harmonic_features)
+
+        # Apply spatial adaptation
+        features = self.spatial_adapt(features)
+
+        return features
 
 class HarmonicAttention(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, in_channels, key_channels=None):
         super().__init__()
-        self.query = nn.Conv2d(channels, channels // 8, 1)
-        self.key = nn.Conv2d(channels, channels // 8, 1)
-        self.value = nn.Conv2d(channels, channels, 1)
+        if key_channels is None:
+            key_channels = in_channels // 8
+
+        self.in_channels = in_channels
+        self.key_channels = key_channels
+
+        self.query = nn.Conv2d(in_channels, key_channels, 1)
+        self.key = nn.Conv2d(in_channels, key_channels, 1)
+        self.value = nn.Conv2d(in_channels, in_channels, 1)
         self.gamma = nn.Parameter(torch.zeros(1))
-        
+
+        # Add spatial reduction for attention computation
+        self.pool = nn.AdaptiveAvgPool2d(16)  # Reduce spatial dimensions to 16x16
+
     def forward(self, x, harmonic_features):
-        batch_size, C, H, W = x.size()
-        
+        batch_size = x.size(0)
+
+        # Apply spatial reduction
+        x_pooled = self.pool(x)
+        h_pooled = self.pool(harmonic_features)
+
         # Compute Query, Key, Value
-        query = self.query(x).view(batch_size, -1, H * W)
-        key = self.key(harmonic_features).view(batch_size, -1, H * W)
-        value = self.value(harmonic_features).view(batch_size, -1, H * W)
-        
+        query = self.query(x_pooled)  # B x key_channels x 16 x 16
+        key = self.key(h_pooled)      # B x key_channels x 16 x 16
+        value = self.value(h_pooled)   # B x in_channels x 16 x 16
+
+        # Reshape for attention computation
+        query = query.view(batch_size, self.key_channels, -1)  # B x key_channels x 256
+        key = key.view(batch_size, self.key_channels, -1)      # B x key_channels x 256
+        value = value.view(batch_size, self.in_channels, -1)   # B x in_channels x 256
+
         # Attention map
-        attention = torch.bmm(query.permute(0, 2, 1), key)
+        attention = torch.bmm(query.permute(0, 2, 1), key)  # B x 256 x 256
         attention = F.softmax(attention, dim=-1)
-        
+
         # Attend to values
-        out = torch.bmm(value, attention.permute(0, 2, 1))
-        out = out.view(batch_size, C, H, W)
-        
+        out = torch.bmm(value, attention.permute(0, 2, 1))  # B x in_channels x 256
+
+        # Reshape back to spatial dimensions
+        out = out.view(batch_size, self.in_channels, 16, 16)
+
+        # Upsample back to original size
+        out = F.interpolate(out, size=x.shape[2:], mode='bilinear', align_corners=False)
+
         return x + self.gamma * out
-    
+
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1.):
         super().__init__()
         self.smooth = smooth
-        
+
     def forward(self, pred, target):
         pred = torch.sigmoid(pred)
-        
+
         # Flatten predictions and targets
         pred = pred.view(-1)
         target = target.view(-1)
-        
+
         intersection = (pred * target).sum()
         dice = (2. * intersection + self.smooth) / (
             pred.sum() + target.sum() + self.smooth
         )
-        
+
         return 1 - dice
 
 class CombinedLoss(nn.Module):
@@ -152,7 +199,7 @@ class CombinedLoss(nn.Module):
         self.bce_weight = bce_weight
         self.dice_loss = DiceLoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
-        
+
     def forward(self, pred, target):
         dice = self.dice_loss(pred, target)
         bce = self.bce_loss(pred, target)
@@ -164,7 +211,7 @@ class HarmonicUNet(nn.Module):
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.bilinear = bilinear
-        
+
         # Encoder
         self.inc = DoubleConv(n_channels, 64)
         self.down1 = Down(64, 128)
@@ -172,14 +219,14 @@ class HarmonicUNet(nn.Module):
         self.down3 = Down(256, 512)
         factor = 2 if bilinear else 1
         self.down4 = Down(512, 1024 // factor)
-        
+
         # Harmonic components
-        self.harmonic_embed = HarmonicEmbedding(embedding_size=256)
+        self.harmonic_embed = HarmonicEmbedding(embedding_size=1024 // factor)
         self.harmonic_attention = HarmonicAttention(1024 // factor)
-        
+
         # Fusion layer
-        self.fusion = nn.Conv2d(1024 // factor + 10, 1024 // factor, 1)
-        
+        self.fusion = nn.Conv2d(1024 // factor * 2, 1024 // factor, 1)
+
         # Decoder
         self.up1 = Up(1024, 512 // factor, bilinear)
         self.up2 = Up(512, 256 // factor, bilinear)
@@ -194,19 +241,22 @@ class HarmonicUNet(nn.Module):
         x3 = self.down2(x2)
         x4 = self.down3(x3)
         x5 = self.down4(x4)
-        
-        # Harmonic embedding
-        h = self.harmonic_embed(x)
-        
+
+        # Get current feature map size
+        curr_size = (x5.size(2), x5.size(3))
+
+        # Harmonic embedding with matching spatial dimensions
+        h = self.harmonic_embed(x, target_size=curr_size)
+
         # Combine CNN and harmonic features
         x5 = self.harmonic_attention(x5, h)
         x5 = self.fusion(torch.cat([x5, h], dim=1))
-        
+
         # Decoder path
         x = self.up1(x5, x4)
         x = self.up2(x, x3)
         x = self.up3(x, x2)
         x = self.up4(x, x1)
         logits = self.outc(x)
-        
+
         return logits
